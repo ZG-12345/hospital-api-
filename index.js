@@ -1,4 +1,4 @@
-// index.js（ヘッダー自動検出版）
+// index.js（本番仕上げ版：DEBUGゲート + CORS制限 + シンプルキャッシュ + ヘッダー自動検出）
 require('dotenv').config();
 
 const express = require('express');
@@ -7,14 +7,30 @@ const fs = require('fs');
 const { google } = require('googleapis');
 
 const app = express();
-app.use(cors());
 
-// ==== ENV ====
+// ===== ENV =====
+const DEBUG = process.env.DEBUG === 'true';                 // true のときだけ /debug/* を公開
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-// タブ名が分からなくても動くように既定は先頭シート全体
-const RANGE = process.env.HOSPITAL_RANGE || 'A1:Z200';
+const RANGE = process.env.HOSPITAL_RANGE || 'A1:Z200';     // 既定は先頭シート
+const CACHE_TTL = Number(process.env.HOSPITAL_CACHE_TTL_MS ?? '60000'); // 0で無効
+const CACHE_MAX = Number(process.env.HOSPITAL_CACHE_MAX ?? '1000');
 
-// ==== Auth loader ====
+// CORS 制限（ALLOWED_ORIGINS にカンマ区切りでドメインを入れる。空なら全許可）
+const allowList = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const corsOrigin = (origin, cb) => {
+  if (!origin) return cb(null, true);                 // curl/サーバ間通信は許可
+  if (allowList.length === 0) return cb(null, true);  // 制限なし
+  if (allowList.includes(origin)) return cb(null, true);
+  return cb(new Error('CORS blocked'), false);
+};
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.options('*', cors({ origin: corsOrigin, credentials: true })); // preflight
+
+// ===== Auth loader =====
 function getAuth() {
   if (process.env.GOOGLE_CREDENTIALS_BASE64) {
     const json = Buffer.from(process.env.GOOGLE_CREDENTIALS_BASE64, 'base64').toString('utf8');
@@ -47,7 +63,7 @@ function getServiceAccountEmailSafe() {
   return null;
 }
 
-// ==== helpers ====
+// ===== helpers =====
 async function getFirstSheetTitle(auth) {
   const s = google.sheets({ version: 'v4', auth });
   const meta = await s.spreadsheets.get({
@@ -62,10 +78,7 @@ async function readRowsWithFallback(auth, range) {
   const s = google.sheets({ version: 'v4', auth });
 
   async function read(r) {
-    const resp = await s.spreadsheets.values.get({
-      spreadsheetId: SPREADSHEET_ID,
-      range: r,
-    });
+    const resp = await s.spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: r });
     return { rows: resp.data.values || [], effectiveRange: r };
   }
 
@@ -79,7 +92,6 @@ async function readRowsWithFallback(auth, range) {
 
     const title = await getFirstSheetTitle(auth);
     if (!title) throw e;
-
     const fallback = range.includes('!') ? `'${title}'!A1:Z200` : `'${title}'!${range}`;
     return await read(fallback);
   }
@@ -91,71 +103,101 @@ function detectHeader(rows) {
     const r = rows[i].map(v => (v ?? '').toString().trim());
     const nameCol = r.findIndex(c => c === '病院名');
     const codeCol = r.findIndex(c => c === '病院コード');
-    if (nameCol !== -1 && codeCol !== -1) {
-      return { headerRow: i, nameCol, codeCol };
-    }
+    if (nameCol !== -1 && codeCol !== -1) return { headerRow: i, nameCol, codeCol };
   }
   return { headerRow: -1, nameCol: -1, codeCol: -1 };
 }
 
-// ==== routes ====
+// ===== health =====
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-app.get('/debug/env', (_req, res) => {
-  res.json({
-    SPREADSHEET_ID_head: (SPREADSHEET_ID || '').slice(0, 10),
-    RANGE,
-    hasBase64: !!process.env.GOOGLE_CREDENTIALS_BASE64,
-    hasLocalKey: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    sa_email: getServiceAccountEmailSafe(),
-  });
-});
-
-app.get('/debug/sheets', async (_req, res) => {
-  try {
-    const auth = getAuth();
-    const s = google.sheets({ version: 'v4', auth });
-    const meta = await s.spreadsheets.get({
-      spreadsheetId: SPREADSHEET_ID,
-      fields: 'sheets(properties(title))',
-    });
-    const titles = (meta.data.sheets || []).map(x => x.properties.title);
-    res.json({ ok: true, sheets: titles, first: titles[0] || null });
-  } catch (e) {
-    res.status(500).json({ ok: false, message: e?.message });
-  }
-});
-
-app.get('/debug/sheet', async (_req, res) => {
-  try {
-    const auth = getAuth();
-    const { rows, effectiveRange } = await readRowsWithFallback(auth, RANGE);
-    const det = detectHeader(rows);
+// ===== debug routes (DEBUG=true のときだけ有効) =====
+if (DEBUG) {
+  app.get('/debug/env', (_req, res) => {
     res.json({
-      ok: true,
-      rows: rows.length,
-      firstRow: rows[0] || null,
-      headerRow: det.headerRow,
-      nameCol: det.nameCol,
-      codeCol: det.codeCol,
-      effectiveRange,
+      SPREADSHEET_ID_head: (SPREADSHEET_ID || '').slice(0, 10),
+      RANGE,
+      hasBase64: !!process.env.GOOGLE_CREDENTIALS_BASE64,
+      hasLocalKey: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      sa_email: getServiceAccountEmailSafe(),
+      ALLOWED_ORIGINS: allowList,
+      CACHE_TTL,
+      CACHE_MAX,
     });
-  } catch (e) {
-    res.status(500).json({
-      ok: false,
-      kind: 'sheet_read_failed',
-      message: e?.message,
-      code: e?.code || e?.response?.status || null,
-      details: e?.response?.data || null,
-    });
-  }
-});
+  });
 
-// ?code=H00001 -> 病院名
+  app.get('/debug/sheets', async (_req, res) => {
+    try {
+      const auth = getAuth();
+      const s = google.sheets({ version: 'v4', auth });
+      const meta = await s.spreadsheets.get({
+        spreadsheetId: SPREADSHEET_ID,
+        fields: 'sheets(properties(title))',
+      });
+      const titles = (meta.data.sheets || []).map(x => x.properties.title);
+      res.json({ ok: true, sheets: titles, first: titles[0] || null });
+    } catch (e) {
+      res.status(500).json({ ok: false, message: e?.message });
+    }
+  });
+
+  app.get('/debug/sheet', async (_req, res) => {
+    try {
+      const auth = getAuth();
+      const { rows, effectiveRange } = await readRowsWithFallback(auth, RANGE);
+      const det = detectHeader(rows);
+      res.json({
+        ok: true,
+        rows: rows.length,
+        firstRow: rows[0] || null,
+        headerRow: det.headerRow,
+        nameCol: det.nameCol,
+        codeCol: det.codeCol,
+        effectiveRange,
+      });
+    } catch (e) {
+      res.status(500).json({
+        ok: false,
+        kind: 'sheet_read_failed',
+        message: e?.message,
+        code: e?.code || e?.response?.status || null,
+        details: e?.response?.data || null,
+      });
+    }
+  });
+}
+
+// ===== simple in-memory cache =====
+const cache = new Map(); // code -> { v:{code,name}, ts }
+function getFromCache(code) {
+  if (CACHE_TTL <= 0) return null;
+  const hit = cache.get(code);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL) {
+    cache.delete(code);
+    return null;
+  }
+  return hit.v;
+}
+function putToCache(code, value) {
+  if (CACHE_TTL <= 0) return;
+  cache.set(code, { v: value, ts: Date.now() });
+  if (cache.size > CACHE_MAX) {
+    const firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
+}
+
+// ===== main API =====
+// GET /api/hospital?code=H00001 -> {code,name}
 app.get('/api/hospital', async (req, res) => {
   try {
     const code = (req.query.code || '').toString().trim();
     if (!code) return res.status(400).json({ error: 'code is required' });
+
+    // cache
+    const cached = getFromCache(code);
+    if (cached) return res.json(cached);
 
     const auth = getAuth();
     const { rows } = await readRowsWithFallback(auth, RANGE);
@@ -163,22 +205,28 @@ app.get('/api/hospital', async (req, res) => {
 
     const { headerRow, nameCol, codeCol } = detectHeader(rows);
     let data = rows;
-
-    // ヘッダーが見つかったら、その行の次から検索
     if (headerRow !== -1) data = rows.slice(headerRow + 1);
 
     // 1) 見出しが検出できたらその列で検索
     if (nameCol !== -1 && codeCol !== -1) {
       const hit = data.find(r => norm(r[codeCol]) === code);
-      if (hit) return res.json({ code, name: norm(hit[nameCol]) });
+      if (hit) {
+        const value = { code, name: norm(hit[nameCol]) };
+        putToCache(code, value);
+        return res.json(value);
+      }
     }
 
-    // 2) フォールバック：行内でコードがある列を見つけ、隣の非空セルを名前とみなす
+    // 2) フォールバック：行内で code に一致→隣セルを名前とみなす
     for (const r of data) {
       const idx = r.findIndex(cell => norm(cell) === code);
       if (idx !== -1) {
         const neighbors = [r[idx - 1], r[idx + 1]].map(norm).filter(Boolean);
-        if (neighbors.length) return res.json({ code, name: neighbors[0] });
+        if (neighbors.length) {
+          const value = { code, name: neighbors[0] };
+          putToCache(code, value);
+          return res.json(value);
+        }
       }
     }
 
@@ -188,5 +236,6 @@ app.get('/api/hospital', async (req, res) => {
   }
 });
 
+// ===== start =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server on :${PORT}`));
